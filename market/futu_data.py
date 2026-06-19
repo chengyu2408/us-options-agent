@@ -32,10 +32,7 @@ class FutuDataProvider:
             return False
 
     async def get_prices(self, code: str, days: int = 100) -> list[float]:
-        """Fetch daily K-line close prices.
-
-        Code format: US.AAPL, HK.00700, etc.
-        """
+        """Fetch daily K-line close prices."""
         if not self._ctx:
             return []
         try:
@@ -43,13 +40,13 @@ class FutuDataProvider:
 
             end = datetime.now()
             start = end - timedelta(days=days)
-            ret, data = self._ctx.get_history_kline(
+            ret, data, page_key = self._ctx.request_history_kline(
                 code=code,
                 start=start.strftime("%Y-%m-%d"),
                 end=end.strftime("%Y-%m-%d"),
                 ktype=ft.KLType.K_DAY,
             )
-            if ret == ft.RET_OK and not data.empty:
+            if ret == ft.RET_OK and data is not None and not data.empty:
                 return data["close"].dropna().tolist()
             return []
         except Exception as e:
@@ -63,26 +60,28 @@ class FutuDataProvider:
         try:
             import futu as ft
 
-            ret, data = self._ctx.get_stock_basicinfo(
-                market=ft.Market.US,
-                stock_type=ft.SecurityType.STOCK,
-                code_list=[code],
-            )
-            if ret == ft.RET_OK and not data.empty:
-                row = data.iloc[0]
-                return {
-                    "code": code,
-                    "name": row.get("name", ""),
-                    "lot_size": int(row.get("lotSize", 0)),
-                    "price_spread": float(row.get("priceSpread", 0)),
-                }
-
-            # Real-time snapshot
+            # Try market snapshot first (more data)
             ret, snap = self._ctx.get_market_snapshot([code])
-            if ret == ft.RET_OK and not snap.empty:
+            if ret == ft.RET_OK and snap is not None and not snap.empty:
                 s = snap.iloc[0]
                 return {
                     "code": code,
+                    "name": s.get("code", ""),
+                    "last_price": float(s.get("lastPrice", 0)),
+                    "open_price": float(s.get("openPrice", 0)),
+                    "high_price": float(s.get("highPrice", 0)),
+                    "low_price": float(s.get("lowPrice", 0)),
+                    "volume": int(s.get("volume", 0)),
+                    "turnover": float(s.get("turnover", 0)),
+                    "change_pct": float(s.get("changePct", 0)),
+                }
+
+            # Fallback to stock quote
+            ret, q = self._ctx.get_stock_quote([code])
+            if ret == ft.RET_OK and q is not None and not q.empty:
+                s = q.iloc[0]
+                return {
+                    "code": s.get("code", code),
                     "last_price": float(s.get("lastPrice", 0)),
                     "open_price": float(s.get("openPrice", 0)),
                     "high_price": float(s.get("highPrice", 0)),
@@ -93,11 +92,11 @@ class FutuDataProvider:
                 }
             return {}
         except Exception as e:
-            logger.warning("Futu quote failed: %s", e)
+            logger.debug("Futu quote (fallback) failed: %s", e)
             return {}
 
     async def get_options_chain(self, us_code: str) -> dict:
-        """Fetch US stock options chain (needs Futu + US options permission)."""
+        """Fetch US stock options chain."""
         if not self._ctx:
             return {}
         try:
@@ -108,13 +107,11 @@ class FutuDataProvider:
                 start=datetime.now().strftime("%Y-%m-%d"),
                 end=(datetime.now() + timedelta(days=60)).strftime("%Y-%m-%d"),
             )
-            if ret == ft.RET_OK and not data.empty:
-                calls = data[data["optionType"] == ft.OptionType.CALL].head(5)
-                puts = data[data["optionType"] == ft.OptionType.PUT].head(5)
+            if ret == ft.RET_OK and data is not None and not data.empty:
                 return {
                     "source": "futu",
-                    "calls": calls.to_dict(orient="records") if not calls.empty else [],
-                    "puts": puts.to_dict(orient="records") if not puts.empty else [],
+                    "calls": data[data["optionType"] == ft.OptionType.CALL].head(5).to_dict(orient="records"),
+                    "puts": data[data["optionType"] == ft.OptionType.PUT].head(5).to_dict(orient="records"),
                 }
             return {}
         except Exception as e:
@@ -122,14 +119,14 @@ class FutuDataProvider:
             return {}
 
     async def get_option_quote(self, option_code: str) -> dict:
-        """Get real-time quote for a specific option contract."""
+        """Get real-time quote + Greeks for an option contract."""
         if not self._ctx:
             return {}
         try:
             import futu as ft
 
             ret, snap = self._ctx.get_market_snapshot([option_code])
-            if ret == ft.RET_OK and not snap.empty:
+            if ret == ft.RET_OK and snap is not None and not snap.empty:
                 s = snap.iloc[0]
                 return {
                     "code": option_code,

@@ -46,7 +46,6 @@ class FutuBroker:
                 port=self._port,
                 security_firm=ft.SecurityFirm.FUTUSECURITIES,
             )
-            # Unlock trade if password is set
             if self._pwd:
                 ret, _ = self._trade_ctx.unlock_trade(password=self._pwd)
                 if ret != ft.RET_OK:
@@ -59,15 +58,15 @@ class FutuBroker:
             return False
 
     async def get_account_summary(self) -> dict:
-        """Fetch account summary."""
+        """Fetch account summary via get_acc_list."""
         if not self._trade_ctx:
             return {"status": "not connected"}
         try:
             import futu as ft
 
-            ret, data = self._trade_ctx.acc_list_query()
+            ret, data = self._trade_ctx.get_acc_list()
             if ret != ft.RET_OK:
-                return {"error": "acc_list_query failed"}
+                return {"error": "get_acc_list failed"}
             accounts = []
             for _, row in data.iterrows():
                 accounts.append({
@@ -109,7 +108,7 @@ class FutuBroker:
         self,
         code: str,
         qty: int,
-        side: str,  # "buy" or "sell"
+        side: str,
         price: float = 0.0,
         order_type: str = "market",
         trd_env: int = 1,
@@ -121,7 +120,7 @@ class FutuBroker:
             import futu as ft
 
             trd_side = ft.TrdSide.BUY if side == "buy" else ft.TrdSide.SELL
-            price_type = ft.OrderType.MARKET if order_type == "market" else ft.OrderType.NORMAL
+            price_type = ft.PriceType.MARKET if order_type == "market" else ft.PriceType.NORMAL
 
             ret, data = self._trade_ctx.place_order(
                 price=price,
@@ -141,7 +140,6 @@ class FutuBroker:
             return {"error": str(e)}
 
     def close(self):
-        """Close connections."""
         if self._quote_ctx:
             try:
                 self._quote_ctx.close()
