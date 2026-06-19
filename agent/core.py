@@ -31,23 +31,21 @@ class AnalysisResult:
 class OptionsAgent:
     """Multi-step LLM agent for US options trading decisions."""
 
-    def __init__(self, llm_client: Any | None = None, model: str = "gpt-4o"):
+    def __init__(self, llm_client: Any | None = None, model: str = "gpt-4o", llm_provider: str = "openai"):
         self.model = model
         self.llm = llm_client
+        self.provider = llm_provider
         self.history: list[AnalysisResult] = []
 
     async def analyze(self, symbol: str, market_data: dict) -> AnalysisResult:
         """Run the full analysis pipeline for a symbol."""
-        # 1. Gather signals
         signals = self._compute_signals(market_data)
 
-        # 2. LLM synthesis (when a client is attached)
         if self.llm:
             reasoning = await self._llm_analyze(symbol, signals)
         else:
             reasoning = "No LLM client configured — using signal-only mode."
 
-        # 3. Decide strategy
         strategy = self._pick_strategy(signals, reasoning)
 
         result = AnalysisResult(
@@ -63,7 +61,6 @@ class OptionsAgent:
         return result
 
     def _compute_signals(self, data: dict) -> dict:
-        """Compute technical + fundamental signals."""
         signals: dict[str, Any] = {"indicators": {}}
         prices = data.get("prices", [])
 
@@ -72,17 +69,13 @@ class OptionsAgent:
             sma_long = sum(prices[-50:]) / 50 if len(prices) >= 50 else sma_short
             signals["indicators"]["sma_20"] = sma_short
             signals["indicators"]["sma_50"] = sma_long
-            signals["indicators"]["trend"] = (
-                "up" if sma_short > sma_long else "down"
-            )
+            signals["indicators"]["trend"] = "up" if sma_short > sma_long else "down"
 
         iv = data.get("implied_volatility")
         if iv:
             signals["indicators"]["iv_rank"] = iv
-            # High IV → premium selling opportunity
             signals["indicators"]["iv_signal"] = "sell_premium" if iv > 0.5 else "neutral"
 
-        # Sentiment heuristic
         trend = signals["indicators"].get("trend", "neutral")
         sentiment_map = {"up": "bullish", "down": "bearish", "neutral": "neutral"}
         signals["sentiment"] = sentiment_map.get(trend, "neutral")
@@ -91,55 +84,54 @@ class OptionsAgent:
         return signals
 
     async def _llm_analyze(self, symbol: str, signals: dict) -> str:
-        """Ask the LLM for a reasoned market read with rich context."""
-        # Extract extra data
+        """Ask the LLM for a reasoned market read (supports OpenAI & Claude)."""
         options_chain = signals.pop("options_chain", {})
         realtime_quote = signals.pop("realtime_quote", {})
 
-        prompt_parts = [f"You are an expert US options trader. Analyze {symbol}."]
-
+        parts = [f"You are an expert US options trader. Analyze {symbol}."]
         if realtime_quote:
-            prompt_parts.append(f"\nCurrent Quote:\n  Price: ${realtime_quote.get('last_price', 'N/A')}")
-            prompt_parts.append(f"  Day Range: ${realtime_quote.get('low_price', 'N/A')} - ${realtime_quote.get('high_price', 'N/A')}")
-            prompt_parts.append(f"  Volume: {realtime_quote.get('volume', 'N/A')}")
+            parts.append(f"\nCurrent Quote:\n  Price: ${realtime_quote.get('last_price', 'N/A')}")
+            parts.append(f"  Day Range: ${realtime_quote.get('low_price', 'N/A')} - ${realtime_quote.get('high_price', 'N/A')}")
+            parts.append(f"  Volume: {realtime_quote.get('volume', 'N/A')}")
 
-        prompt_parts.append(f"\nTechnical Signals:\n{json.dumps(signals, indent=2)}")
+        parts.append(f"\nTechnical Signals:\n{json.dumps(signals, indent=2)}")
 
         if options_chain and options_chain.get("calls"):
-            calls = options_chain["calls"][:3]
-            puts = options_chain["puts"][:3]
-            prompt_parts.append("\nNear-term Options Chain:")
-            for c in calls:
-                strike = c.get("strike", "?")
-                prompt_parts.append(f"  CALL ${strike}")
-            for p in puts:
-                strike = p.get("strike", "?")
-                prompt_parts.append(f"  PUT  ${strike}")
+            call_strikes = [f"CALL ${c.get('strike', '?')}" for c in options_chain["calls"][:3]]
+            put_strikes = [f"PUT  ${p.get('strike', '?')}" for p in options_chain["puts"][:3]]
+            parts.append("\nNear-term Options Chain:\n" + "\n".join(call_strikes + put_strikes))
 
-        prompt_parts.append("""
-
+        parts.append("""
 Provide a concise analysis covering:
 1. Market regime (bullish/bearish/neutral) and why
-2. An appropriate options strategy (covered call, cash-secured put, iron condor, vertical spread, long call/put)
+2. An appropriate options strategy
 3. Key risks to watch
 4. Suggested trade structure (strike, expiry bias)
-
 Be specific and actionable.""")
 
-        prompt = "\n".join(prompt_parts)
+        prompt = "\n".join(parts)
+
         try:
-            resp = await self.llm.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-            )
-            return resp.choices[0].message.content or "No response."
+            if self.provider == "claude":
+                resp = await self.llm.messages.create(
+                    model=self.model,
+                    max_tokens=1024,
+                    temperature=0.3,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return resp.content[0].text or "No response."
+            else:
+                resp = await self.llm.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                )
+                return resp.choices[0].message.content or "No response."
         except Exception as e:
             logger.warning("LLM analysis failed: %s", e)
             return f"LLM unavailable: {e}"
 
     def _pick_strategy(self, signals: dict, reasoning: str) -> str | None:
-        """Rule-based strategy fallback."""
         sentiment = signals.get("sentiment", "neutral")
         iv_signal = signals.get("indicators", {}).get("iv_signal", "neutral")
 
