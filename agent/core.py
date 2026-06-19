@@ -91,17 +91,42 @@ class OptionsAgent:
         return signals
 
     async def _llm_analyze(self, symbol: str, signals: dict) -> str:
-        """Ask the LLM for a reasoned market read."""
-        prompt = f"""You are an expert US options trader. Analyze {symbol}.
+        """Ask the LLM for a reasoned market read with rich context."""
+        # Extract extra data
+        options_chain = signals.pop("options_chain", {})
+        realtime_quote = signals.pop("realtime_quote", {})
 
-Signals:
-{json.dumps(signals, indent=2)}
+        prompt_parts = [f"You are an expert US options trader. Analyze {symbol}."]
 
-Provide:
-1. Market regime (bullish/bearian/neutral)
-2. Recommended options strategy (e.g. covered call, cash-secured put, iron condor, long call)
-3. Key risks
-Keep it concise and actionable."""
+        if realtime_quote:
+            prompt_parts.append(f"\nCurrent Quote:\n  Price: ${realtime_quote.get('last_price', 'N/A')}")
+            prompt_parts.append(f"  Day Range: ${realtime_quote.get('low_price', 'N/A')} - ${realtime_quote.get('high_price', 'N/A')}")
+            prompt_parts.append(f"  Volume: {realtime_quote.get('volume', 'N/A')}")
+
+        prompt_parts.append(f"\nTechnical Signals:\n{json.dumps(signals, indent=2)}")
+
+        if options_chain and options_chain.get("calls"):
+            calls = options_chain["calls"][:3]
+            puts = options_chain["puts"][:3]
+            prompt_parts.append("\nNear-term Options Chain:")
+            for c in calls:
+                strike = c.get("strike", "?")
+                prompt_parts.append(f"  CALL ${strike}")
+            for p in puts:
+                strike = p.get("strike", "?")
+                prompt_parts.append(f"  PUT  ${strike}")
+
+        prompt_parts.append("""
+
+Provide a concise analysis covering:
+1. Market regime (bullish/bearish/neutral) and why
+2. An appropriate options strategy (covered call, cash-secured put, iron condor, vertical spread, long call/put)
+3. Key risks to watch
+4. Suggested trade structure (strike, expiry bias)
+
+Be specific and actionable.""")
+
+        prompt = "\n".join(prompt_parts)
         try:
             resp = await self.llm.chat.completions.create(
                 model=self.model,

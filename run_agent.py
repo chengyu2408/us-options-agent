@@ -2,18 +2,20 @@
 US Options Agent — entry point.
 
 Usage:
-  python run_agent.py                      # yfinance (no broker connection needed)
-  python run_agent.py --futu               # Futu data + paper trading
-  python run_agent.py --symbol SPY,QQQ     # custom watchlist
+  python run_agent.py --llm                      # yfinance + DeepSeek LLM
+  python run_agent.py --futu --llm               # Futu + DeepSeek LLM
+  python run_agent.py --symbol SPY,QQQ            # custom watchlist
 
 Environment:
-  Export your API keys in .env or env vars when needed.
+  LLM_API_KEY   DeepSeek / OpenAI API key (or find it from your OpenClaw config)
+  LLM_MODEL     Model name, default: deepseek-chat
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -35,158 +37,166 @@ def parse_args():
         help="Stock symbol(s), comma-separated (default: SPY)",
     )
     p.add_argument("--paper", action="store_true", default=True, help="Paper trade (default)")
-    p.add_argument("--no-llm", action="store_true", help="Skip LLM, signal-only")
+    p.add_argument("--llm", action="store_true", help="Enable LLM market analysis")
     return p.parse_args()
 
 
-async def run_with_yfinance(symbols: list[str], use_llm: bool):
-    """Run agent using yfinance data (no broker connection needed)."""
+def build_llm_client():
+    """Build an OpenAI-compatible LLM client (DeepSeek by default)."""
+    from openai import AsyncOpenAI
+
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
+    model = os.getenv("LLM_MODEL", "deepseek-chat")
+    base_url = os.getenv("LLM_API_BASE", "https://api.deepseek.com")
+
+    if not api_key:
+        # Try to read from OpenClaw's auth store
+        try:
+            import sqlite3
+
+            db = os.path.expanduser("~/.openclaw/agents/main/agent/openclaw-agent.sqlite")
+            if os.path.exists(db):
+                conn = sqlite3.connect(db)
+                cur = conn.execute("SELECT store_json FROM auth_profile_store WHERE store_key='primary'")
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    store = json.loads(row[0])
+                    dp = store.get("profiles", {}).get("deepseek:default", {})
+                    api_key = dp.get("key", "")
+                    if api_key:
+                        logger.info("Read DeepSeek API key from OpenClaw auth store")
+        except Exception as e:
+            logger.debug("Could not read auth store: %s", e)
+
+    if not api_key:
+        print("\n⚠  No API key found. Set LLM_API_KEY or DEEPSEEK_API_KEY env var.")
+        print("   Or get it from your OpenClaw config and set it:")
+        print("   export LLM_API_KEY=sk-xxx")
+        return None, model
+
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    return client, model
+
+
+async def run_with_yfinance(symbols: list[str], llm_config: tuple | None):
+    """Run agent using yfinance data."""
     from agent.core import OptionsAgent
     from market.data import MarketDataProvider
 
     provider = MarketDataProvider()
-    agent = OptionsAgent() if not use_llm else OptionsAgent(
-        model=os.getenv("LLM_MODEL", "gpt-4o"),
-    )
+    llm_client, model = llm_config if llm_config else (None, "gpt-4o")
+    agent = OptionsAgent(llm_client=llm_client, model=model)
 
-    print("\n" + "=" * 60)
-    print("  🤖 US OPTIONS AGENT — yfinance mode")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print("  🤖 US OPTIONS AGENT — yfinance mode" + (" (with LLM 🧠)" if llm_client else ""))
+    print("=" * 65)
 
     for symbol in symbols:
         print(f"\n📊 Analyzing {symbol}...")
 
-        # Fetch data
         prices = await provider.get_prices(symbol)
         iv = await provider.get_implied_volatility(symbol)
+        chain = await provider.get_options_chain(symbol)
+
+        market_data = {
+            "prices": prices,
+            "implied_volatility": iv,
+            "options_chain": chain,
+        }
 
         if not prices:
             print(f"  ⚠ No price data for {symbol}")
             continue
 
-        # Run agent
-        result = await agent.analyze(symbol, {
-            "prices": prices,
-            "implied_volatility": iv,
-        })
+        result = await agent.analyze(symbol, market_data)
 
-        # Print analysis
-        print(f"  {'Price samples':20s} {prices[-1]:>8.2f} (last) / {len(prices)} days")
+        # Print summary
+        print(f"  {'Price':20s} ${prices[-1]:<8.2f} ({len(prices)} days)")
         print(f"  {'Sentiment':20s} {result.sentiment.upper():>8}  ({result.confidence:.0%} confidence)")
-        print(f"  {'Recommended':20s} {result.strategy or 'HOLD / no signal'}")
-        print(f"  {'Current IV':20s} {f'{iv:.1%}' if iv else 'N/A'}")
+        print(f"  {'Recommendation':20s} {result.strategy or 'HOLD / no signal'}")
+        print(f"  {'IV':20s} {f'{iv:.1%}' if iv else 'N/A'}")
 
-        # Print key indicators
         ind = result.signals.get("indicators", {})
         if ind.get("trend"):
-            print(f"  {'Trend':20s} {ind['trend']} (SMA20={ind.get('sma_20', 0):.1f}, SMA50={ind.get('sma_50', 0):.1f})")
-        if ind.get("iv_signal"):
-            print(f"  {'IV Signal':20s} {ind['iv_signal']}")
+            print(f"  {'Trend':20s} {ind['trend']} (SMA20={ind.get('sma_20', 0):.1f})")
 
-        # Brief reasoning
-        if result.reasoning and not result.reasoning.startswith("No LLM"):
-            print(f"  {'Reasoning':20s} {result.reasoning[:150]}...")
-
-        # Try options chain
-        chain = await provider.get_options_chain(symbol)
         if chain and chain.get("calls"):
-            print(f"\n  📋 Near-term options chain ({chain.get('expiration', '?')}):")
-            for c in chain["calls"][:3]:
-                strike = c.get("strike", 0)
-                price = c.get("lastPrice", c.get("bid", "?"))
-                print(f"    CALL  ${strike:<8} ${price:<8}")
-            for p in chain["puts"][:3]:
-                strike = p.get("strike", 0)
-                price = p.get("lastPrice", p.get("bid", "?"))
-                print(f"    PUT   ${strike:<8} ${price:<8}")
+            print(f"  {'Options Chain':20s} {len(chain['calls'])} calls, {len(chain['puts'])} puts")
 
-    print("\n" + "=" * 60)
+        # LLM reasoning
+        if result.reasoning and not result.reasoning.startswith("No LLM"):
+            print(f"\n  🧠 LLM Analysis:")
+            for line in result.reasoning.strip().split("\n"):
+                print(f"     {line}")
+
+    print("\n" + "=" * 65)
     print(f"  ✅ Done — {len(agent.history)} analyses completed")
-    print("=" * 60 + "\n")
+    print("=" * 65 + "\n")
 
 
-async def run_with_futu(symbols: list[str], paper: bool):
+async def run_with_futu(symbols: list[str], paper: bool, llm_config: tuple | None):
     """Run agent using Futu OpenAPI data + trading."""
     from agent.core import OptionsAgent
     from market.futu_data import FutuDataProvider
     from market.futu_broker import FutuBroker
 
     provider = FutuDataProvider()
-    broker = FutuBroker(
-        pwd_unlock=os.getenv("FUTU_TRADE_PWD", ""),
-    )
+    broker = FutuBroker(pwd_unlock=os.getenv("FUTU_TRADE_PWD", ""))
+    llm_client, model = llm_config if llm_config else (None, "gpt-4o")
+    agent = OptionsAgent(llm_client=llm_client, model=model)
 
-    print("\n" + "=" * 60)
-    print("  🤖 US OPTIONS AGENT — Futu OpenAPI mode")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print("  🤖 US OPTIONS AGENT — Futu OpenAPI" + (" (with LLM 🧠)" if llm_client else ""))
+    print("=" * 65)
 
-    # Connect
     print("\n🔌 Connecting to Futu OpenAPI...")
     if not await provider.connect():
         print("  ❌ Cannot connect to Futu OpenAPI server.")
-        print("  Make sure Futu OpenAPI is running on your machine.")
-        print("  https://openapi.futunn.com/")
+        print("  Make sure Futu OpenAPI is running (port 11111).")
         return
-
     if paper:
         await broker.connect_trade(trd_env=1)
-    else:
-        await broker.connect_trade(trd_env=0)
 
-    # Check account
     acct = await broker.get_account_summary()
-    print(f"  Account: {acct}")
-
-    # Build agent (no LLM client by default)
-    agent = OptionsAgent()
+    print(f"  Account: {acct.get('accounts', [])}")
 
     for symbol in symbols:
         us_code = f"US.{symbol}" if not symbol.startswith("US.") else symbol
         print(f"\n📊 Analyzing {us_code}...")
 
-        # Futu real-time data
+        # 1. Real-time quote
         quote = await provider.get_realtime_quote(us_code)
         if quote.get("last_price"):
-            print(f"  {'Last Price':20s} ${quote['last_price']:<8.2f}  ({quote.get('change_pct', 0):.2f}%)")
-            print(f"  {'Day Range':20s} ${quote.get('low_price', 0):.2f} - ${quote.get('high_price', 0):.2f}")
-            print(f"  {'Volume':20s} {quote.get('volume', 0):,}")
+            print(f"  {'Last Price':20s} ${quote['last_price']:<8.2f}  ({quote.get('change_pct', 0):+.2f}%)")
 
-        # K-line prices
+        # 2. K-line prices for signal computation
         prices = await provider.get_prices(us_code)
-        if not prices:
-            print(f"  ⚠ No K-line data for {symbol}")
-            continue
+        print(f"  {'K-line Data':20s} {len(prices)} days of data")
 
-        # Futures options chain
+        # 3. Options chain
         chain = await provider.get_options_chain(us_code)
-        if chain:
-            print(f"\n  📋 Options chain (Futu):")
-            for c in chain.get("calls", [])[:3]:
-                strike = c.get("strike", "?")
-                print(f"    CALL  ${strike}")
-            for p in chain.get("puts", [])[:3]:
-                strike = p.get("strike", "?")
-                print(f"    PUT   ${strike}")
+        if chain and chain.get("calls"):
+            print(f"  {'Options Chain':20s} {len(chain['calls'])} near-term calls available")
 
-        # Run analysis
-        result = await agent.analyze(symbol, {"prices": prices})
-        print(f"  {'Sentiment':20s} {result.sentiment.upper():>8}")
+        # 4. Run agent analysis
+        market_data = {
+            "prices": prices or [],
+            "implied_volatility": None,
+            "options_chain": chain,
+            "realtime_quote": quote,
+        }
+
+        result = await agent.analyze(symbol, market_data)
+
+        print(f"  {'Sentiment':20s} {result.sentiment.upper():>8}  ({result.confidence:.0%})")
         print(f"  {'Recommendation':20s} {result.strategy or 'HOLD'}")
 
-        # Option Greeks for a specific contract (example)
-        if chain and chain.get("calls"):
-            opt_code = chain["calls"][0].get("code", "")
-            if opt_code:
-                greeks = await provider.get_option_quote(opt_code)
-                if greeks:
-                    print(f"\n  📐 Greeks (near-term ATM call):")
-                    print(f"    {'Delta':10s} {greeks.get('delta', 'N/A')}")
-                    print(f"    {'Gamma':10s} {greeks.get('gamma', 'N/A')}")
-                    print(f"    {'Theta':10s} {greeks.get('theta', 'N/A')}")
-                    print(f"    {'Vega':10s} {greeks.get('vega', 'N/A')}")
-                    print(f"    {'IV':10s} {greeks.get('implied_vol', 'N/A')}")
+        if result.reasoning and not result.reasoning.startswith("No LLM"):
+            print(f"\n  🧠 LLM Analysis:")
+            for line in result.reasoning.strip().split("\n"):
+                print(f"     {line}")
 
-    # Cleanup
     provider.close()
     broker.close()
     print("\n✅ Done — connections closed.")
@@ -194,13 +204,19 @@ async def run_with_futu(symbols: list[str], paper: bool):
 
 async def main():
     args = parse_args()
+
+    llm_config = None
+    if args.llm:
+        client, model = build_llm_client()
+        if client:
+            llm_config = (client, model)
+
     symbols = [s.strip() for s in args.symbol.split(",")]
-    use_llm = not args.no_llm
 
     if args.futu:
-        await run_with_futu(symbols, args.paper)
+        await run_with_futu(symbols, args.paper, llm_config)
     else:
-        await run_with_yfinance(symbols, use_llm)
+        await run_with_yfinance(symbols, llm_config)
 
 
 if __name__ == "__main__":
