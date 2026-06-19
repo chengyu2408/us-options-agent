@@ -1,0 +1,25 @@
+# Python env
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env files
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data / reports
+data/
+reports/
+logs/
